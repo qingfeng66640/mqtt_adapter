@@ -1,0 +1,1 @@
+"""MQTT adapter plugin package."""

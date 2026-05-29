@@ -1,0 +1,26 @@
+{
+  "name": "mqtt_adapter",
+  "version": "0.1.0",
+  "description": "MQTT relay adapter for Neo-MoFox",
+  "author": "MoFox Team",
+  "categories": ["chat"],
+  "tags": ["mqtt", "adapter", "relay"],
+  "dependencies": {
+    "plugins": [],
+    "components": []
+  },
+  "include": [
+    {
+      "component_type": "adapter",
+      "component_name": "mqtt_adapter",
+      "dependencies": [],
+      "enabled": true
+    }
+  ],
+  "entry_point": "plugin.py",
+  "min_core_version": "1.0.0",
+  "python_dependencies": [
+    "paho-mqtt>=2.0"
+  ],
+  "dependencies_required": true
+}
