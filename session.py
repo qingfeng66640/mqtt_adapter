@@ -1,4 +1,20 @@
-"""MQTT relay session helpers."""
+"""MQTT 中继会话管理：事务状态机和社交会话控制。
+
+SessionManager 是适配器的会话层核心，负责:
+
+1. **事务信道 (transaction)**: 基于状态机的结构化交互
+   - 状态: created → pending_reply → accepted → closed
+   - 意图: notify / request / invite / accept / decline / confirm / cancel / close / reschedule / ack
+   - 每次消息收发驱动状态转移，跟踪 reply_budget 和 allowed_responders
+
+2. **社交信道 (social)**: 基于阶段的自由对话
+   - 阶段: opening → active → cooling → ending → closed
+   - 通过 turn_count 和 max_turns 自动推进阶段
+   - 支持冷却时间 (cooldown) 控制对话节奏
+
+3. **信封构建**: 从框架 MessageEnvelope 构建出站 RelayEnvelope，
+   并将会话状态编码到 relay_context 中供下游使用。
+"""
 
 from __future__ import annotations
 
@@ -11,8 +27,33 @@ from .envelope import RelayEnvelope
 
 
 class SessionManager:
-    """Provide relay transaction and social session semantics."""
+    """提供中继事务和社交会话的语义管理。
 
+    事务会话使用确定性的状态机（_TRANSITIONS 字典），每个状态
+    只允许特定的 intent 触发转移。社交会话使用阶段推进模型，
+    基于轮次计数和冷却时间自动流转。
+
+    使用示例::
+
+        mgr = SessionManager()
+
+        # 构建外发信封
+        envelope = mgr.build_outbound_envelope(
+            message_envelope=msg_envelope,
+            from_bot="bot_a",
+            from_bot_name="Bot A",
+            to_bot="bot_b",
+            to_bot_name="Bot B",
+        )
+
+        # 同步入站会话状态
+        session = mgr.sync_inbound_transaction_session(inbound_envelope)
+    """
+
+    # 事务状态转移表:
+    #   当前状态 → {intent → 下一状态}
+    #   notify/request/invite 从 created 发起新会话
+    #   accept/decline/close 等从 pending_reply 或 accepted 推进
     _TRANSITIONS = {
         "created": {"notify": "closed", "request": "pending_reply", "invite": "pending_reply"},
         "pending_reply": {
@@ -41,6 +82,10 @@ class SessionManager:
     _SOCIAL_END_PHASES = {"ending", "closed"}
     _SOCIAL_PHASE_ORDER = ("opening", "active", "cooling", "ending", "closed")
 
+    # ------------------------------------------------------------------
+    # 出站信封构建
+    # ------------------------------------------------------------------
+
     def build_outbound_envelope(
         self,
         *,
@@ -52,7 +97,29 @@ class SessionManager:
         default_ttl: int = 4,
         default_reply_budget: int = 3,
     ) -> RelayEnvelope:
-        """Build an outbound relay envelope from a MessageEnvelope."""
+        """从框架 MessageEnvelope 构建外发 RelayEnvelope。
+
+        根据 relay_context 中的 channel 类型分两路处理:
+
+        1. **社交信道 (social)**: 委托给 build_social_envelope()
+        2. **事务信道 (transaction)**: 在此方法中直接构建，流程如下:
+           - 从上下文中解析 intent（显式指定 > 从会话推断 > 默认 "notify"）
+           - 根据 intent 设置 terminal/expect_reply/reply_budget 等控制字段
+           - 如果存在已有会话，继承其状态（reply_budget、allowed_responders 等）
+           - 将新会话或更新后的会话保存到 store
+
+        参数:
+            message_envelope: 框架层的出站消息信封。
+            from_bot: 发送方 bot ID。
+            from_bot_name: 发送方 bot 名称。
+            to_bot: 接收方 bot ID。
+            to_bot_name: 接收方 bot 名称。
+            default_ttl: TTL 默认值（跳数上限）。
+            default_reply_budget: 回复预算默认值。
+
+        返回:
+            构建完成的 RelayEnvelope，会话状态已持久化到 store。
+        """
 
         text = _extract_text(message_envelope)
         extra = _extract_extra(message_envelope)
@@ -158,7 +225,18 @@ class SessionManager:
         return envelope
 
     def relay_context_from_envelope(self, envelope: RelayEnvelope) -> dict[str, object]:
-        """Build message extra relay context from an envelope."""
+        """从信封提取 relay_context 字典，嵌入到 MessageEnvelope.extra 中。
+
+        relay_context 是传递给下游组件（chatter、action 等）的标准化上下文，
+        包含会话标识、对端信息、控制字段等，让下游能根据中继状态
+        做出正确决策（如是否应自动回复）。
+
+        参数:
+            envelope: 中继信封。
+
+        返回:
+            包含会话上下文信息的字典。
+        """
 
         return {
             "conversation_id": envelope.conversation_id,
@@ -175,8 +253,27 @@ class SessionManager:
             "allowed_responders": list(envelope.allowed_responders),
         }
 
+    # ------------------------------------------------------------------
+    # 入站会话同步
+    # ------------------------------------------------------------------
+
     def sync_inbound_transaction_session(self, envelope: RelayEnvelope) -> store.RelaySession | None:
-        """Persist inbound transaction state from a validated relay envelope."""
+        """根据入站事务信封同步本地会话状态。
+
+        处理流程:
+        1. 检查 channel 是否为 "transaction"（非事务信道返回 None）
+        2. 查找已有会话，确定当前状态
+        3. 根据 _TRANSITIONS 表查找状态转移目标
+        4. 计算新的 terminal、reply_budget、allowed_responders 等
+        5. 将更新后的会话保存到 store
+
+        参数:
+            envelope: 已验证的入站事务信封。
+
+        返回:
+            更新后的 RelaySession，如果 channel 不是 "transaction"
+            或 intent 不在已知事务意图中则返回 None。
+        """
 
         if envelope.channel != "transaction":
             return None
@@ -228,7 +325,24 @@ class SessionManager:
 
     @staticmethod
     def _derive_inbound_allowed_responders(*, state: str, terminal: bool, local_bot_id: str) -> list[str]:
-        """Derive trusted inbound responders from local state only."""
+        """根据本地状态推导当前允许的回复者列表。
+
+        规则:
+        - terminal 状态下不允许任何人回复 → 返回空列表
+        - pending_reply / accepted / reschedule_requested 状态下，
+          仅本地 bot 可以回复（local_bot_id）
+        - 其他状态 → 返回空列表
+
+        这是从本地视角的安全推导，不依赖对端声称的 allowed_responders。
+
+        参数:
+            state: 当前会话状态。
+            terminal: 是否已终结。
+            local_bot_id: 本地 bot 的 ID。
+
+        返回:
+            允许回复的 bot_id 列表。
+        """
 
         if terminal:
             return []
@@ -237,7 +351,19 @@ class SessionManager:
         return []
 
     def sync_inbound_social_session(self, envelope: RelayEnvelope) -> store.RelaySession | None:
-        """Persist inbound social state before the local bot replies."""
+        """根据入站社交信封同步本地社交会话状态。
+
+        社交会话使用阶段（phase）模型而非状态机模型。处理逻辑:
+        - 使用信封中的 phase，或继承已有会话的 phase，默认 "active"
+        - 根据 terminal 标志或是否处于结束阶段来判断是否终结
+        - 非终结状态下保留 reply_budget 和 allowed_responders
+
+        参数:
+            envelope: 已验证的入站社交信封。
+
+        返回:
+            更新后的 RelaySession，非社交信道返回 None。
+        """
 
         if envelope.channel != "social":
             return None
@@ -266,6 +392,10 @@ class SessionManager:
         store.save_session(session)
         return session
 
+    # ------------------------------------------------------------------
+    # 社交会话构建
+    # ------------------------------------------------------------------
+
     def build_social_envelope(
         self,
         *,
@@ -280,7 +410,28 @@ class SessionManager:
         cooldown_seconds: int = 0,
         max_turns: int = 6,
     ) -> RelayEnvelope:
-        """Build a social-channel envelope with reply controls."""
+        """构建社交信道信封，附带回复控制字段。
+
+        社交会话的生命周期:
+        1. 首次消息 (opening): phase 自动推进到 "active"
+        2. 已有活跃会话: 调用 advance_social_turn() 推进轮次
+        3. 已结束会话: 保持结束状态，reply_budget 清零
+
+        参数:
+            from_bot: 发送方 bot ID。
+            from_bot_name: 发送方 bot 名称。
+            to_bot: 接收方 bot ID。
+            to_bot_name: 接收方 bot 名称。
+            text: 消息文本内容。
+            conversation_id: 显式指定的会话 ID（可选，不指定则复用已有会话）。
+            phase: 初始阶段，默认 "opening"。
+            reply_budget: 回复预算。
+            cooldown_seconds: 冷却时间（秒）。
+            max_turns: 最大轮次。
+
+        返回:
+            构建完成的社交信道 RelayEnvelope。
+        """
 
         existing = self._find_social_session(to_bot, conversation_id=conversation_id)
         if existing is not None and not existing.terminal:
@@ -323,7 +474,21 @@ class SessionManager:
         return self.apply_expect_reply_overrides(envelope)
 
     def _find_social_session(self, peer_bot_id: str, conversation_id: str | None = None) -> store.RelaySession | None:
-        """Return the stored social session for a peer bot."""
+        """查找与指定 peer bot 的社交会话。
+
+        查找策略:
+        1. 如果指定了 conversation_id，直接精确查找
+        2. 否则在所有会话中匹配 peer_bot_id 和 channel == "social"
+        3. 优先返回活跃的（非 terminal、非结束阶段）会话
+        4. 如果有多个候选，返回最近更新的那个
+
+        参数:
+            peer_bot_id: 伙伴 bot ID。
+            conversation_id: 可选的会话 ID 精确匹配。
+
+        返回:
+            匹配的 RelaySession，未找到时返回 None。
+        """
 
         if conversation_id is not None:
             session = store.get_session(conversation_id)
@@ -340,7 +505,21 @@ class SessionManager:
         return max(pool, key=lambda session: session.updated_at) if pool else None
 
     def apply_expect_reply_overrides(self, envelope: RelayEnvelope) -> RelayEnvelope:
-        """Apply expect_reply override priority."""
+        """应用 expect_reply 覆盖规则的优先级判断。
+
+        规则（按优先级降序）:
+        1. terminal=True → expect_reply=False（终结消息不需要回复）
+        2. reply_budget <= 0 → expect_reply=False（没有回复配额）
+        3. allowed_responders 为空 → expect_reply=False（没人能回复）
+        4. phase 处于结束阶段 → expect_reply=False（对话已结束）
+        5. 以上都不满足 → expect_reply=True
+
+        参数:
+            envelope: 需要检查的信封（会被原地修改）。
+
+        返回:
+            更新后的同一信封实例。
+        """
 
         if envelope.terminal is True:
             envelope.expect_reply = False
@@ -358,7 +537,14 @@ class SessionManager:
         return envelope
 
     def save_social_session_from_envelope(self, envelope: RelayEnvelope) -> store.RelaySession:
-        """Persist minimal social-session state into the shared store."""
+        """将信封中的社交会话状态持久化到 store。
+
+        参数:
+            envelope: 包含社交会话信息的信封。
+
+        返回:
+            保存后的 RelaySession 实例。
+        """
 
         existing = store.get_session(envelope.conversation_id)
         session = store.RelaySession(
@@ -380,10 +566,26 @@ class SessionManager:
         store.save_session(session)
         return session
 
+    # ------------------------------------------------------------------
+    # 兼容性与辅助
+    # ------------------------------------------------------------------
+
     def maybe_create_memory_candidate(self, *, envelope: RelayEnvelope) -> None:
-        """Keep API compatibility without owning memory projection."""
+        """保持 API 兼容性的占位方法。
+
+        在原始的 bot_private_relay 中此方法负责创建记忆候选，
+        但独立的 mqtt_adapter 不拥有记忆投影职责。保留此方法
+        仅为了兼容可能的外部调用者。
+
+        参数:
+            envelope: 中继信封（未使用）。
+        """
 
         _ = envelope
+
+    # ------------------------------------------------------------------
+    # 事务动作校验与执行
+    # ------------------------------------------------------------------
 
     def validate_transaction_action(
         self,
@@ -393,7 +595,26 @@ class SessionManager:
         caller_bot: str,
         payload_complete: bool = True,
     ) -> tuple[bool, str, store.RelaySession | None]:
-        """Run transaction action checks."""
+        """校验一个事务动作是否合法。
+
+        检查项:
+        1. 会话是否存在 → invalid_payload
+        2. 会话是否已终结 → conversation_closed
+        3. 当前状态是否允许此 action → state_not_allowed
+        4. 调用者是否在 allowed_responders 中 → not_allowed_responder
+        5. 回复预算是否耗尽 → reply_budget_exhausted
+        6. payload 是否完整 → invalid_payload
+
+        参数:
+            conversation_id: 目标会话 ID。
+            action: 要执行的动作（intent）。
+            caller_bot: 动作发起方的 bot ID。
+            payload_complete: payload 是否完整。
+
+        返回:
+            (是否合法, 状态码, 会话对象) 三元组。
+            状态码: "ok" 表示合法，其他为错误原因。
+        """
 
         session = store.get_session(conversation_id)
         if session is None:
@@ -412,7 +633,26 @@ class SessionManager:
         return True, "ok", session
 
     def apply_transaction_action(self, *, conversation_id: str, action: str, caller_bot: str) -> store.RelaySession:
-        """Advance session after a validated transaction action."""
+        """执行已验证的事务动作并推进会话状态。
+
+        执行步骤:
+        1. 查找会话（不存在则抛出异常）
+        2. 根据 _TRANSITIONS 表计算新状态
+        3. 更新 session 的 state、intent、reply_budget、terminal 等字段
+        4. 如果是终端动作（confirm/decline/cancel/ack/close），清空 allowed_responders
+        5. 如果是 accept/reschedule，将回复权限转交给对端
+
+        参数:
+            conversation_id: 目标会话 ID。
+            action: 要执行的动作。
+            caller_bot: 动作发起方的 bot ID（未使用，保留用于未来扩展）。
+
+        返回:
+            更新后的会话对象。
+
+        异常:
+            ValueError: 会话不存在时抛出。
+        """
 
         session = store.get_session(conversation_id)
         if session is None:
@@ -438,6 +678,10 @@ class SessionManager:
             store.save_transaction_record(record)
         return session
 
+    # ------------------------------------------------------------------
+    # 内部辅助
+    # ------------------------------------------------------------------
+
     def _find_session_for_outbound(
         self,
         *,
@@ -445,7 +689,21 @@ class SessionManager:
         message_envelope: MessageEnvelope,
         to_bot: str,
     ) -> store.RelaySession | None:
-        """Find an outbound session by explicit conversation id or peer bot id."""
+        """为外发消息查找对应的已有会话。
+
+        查找优先级:
+        1. context 中的 conversation_id（精确匹配）
+        2. 与 to_bot 的未关闭事务会话
+        3. 与 message_info.user_info.user_id 的未关闭事务会话
+
+        参数:
+            context: relay_context 字典。
+            message_envelope: 外发消息信封。
+            to_bot: 目标 bot ID。
+
+        返回:
+            匹配的会话，没有则返回 None。
+        """
 
         conversation_id = context.get("conversation_id")
         if isinstance(conversation_id, str) and conversation_id:
@@ -463,7 +721,20 @@ class SessionManager:
 
     @staticmethod
     def _infer_intent_from_session(session: store.RelaySession | None) -> str | None:
-        """Infer outbound intent from current transaction session state."""
+        """从当前事务会话状态推断外发 intent。
+
+        推断规则:
+        - accepted 状态 → intent="accept"（确认接受）
+        - reschedule_requested 状态 → intent="reschedule"
+        - closed 状态 → 如果之前是 notify/confirm/decline 等则保持，
+          否则默认 "close"
+
+        参数:
+            session: 当前会话状态。
+
+        返回:
+            推断出的 intent 字符串，无会话时返回 None。
+        """
 
         if session is None:
             return None
@@ -480,16 +751,37 @@ class SessionManager:
 
     @classmethod
     def _transaction_intents(cls) -> set[str]:
-        """Return known transaction intents from the transition table."""
+        """返回所有已知的事务 intent 集合。
+
+        从 _TRANSITIONS 表中提取所有可能的 intent 值，
+        包括 created 状态的发起 intent 和所有转移表中的 action intent。
+
+        返回:
+            所有已知 intent 字符串的集合。
+        """
 
         intents = set(cls._TRANSITIONS["created"])
         for transitions in cls._TRANSITIONS.values():
             intents.update(transitions)
         return intents
 
+    # ------------------------------------------------------------------
+    # 社交会话阶段推进
+    # ------------------------------------------------------------------
+
     @staticmethod
     def _next_social_phase(current: str) -> str:
-        """Return the next social phase in the ordered chain."""
+        """返回社交阶段链中的下一个阶段。
+
+        阶段链: opening → active → cooling → ending → closed
+        如果当前阶段不在链中或已是最后一个阶段，返回 "closed"。
+
+        参数:
+            current: 当前阶段名称。
+
+        返回:
+            下一个阶段名称。
+        """
 
         try:
             idx = SessionManager._SOCIAL_PHASE_ORDER.index(current)
@@ -506,7 +798,24 @@ class SessionManager:
         max_turns: int = 6,
         cooldown_seconds: int = 0,
     ) -> store.RelaySession:
-        """Increment turn count and advance social phase when thresholds are met."""
+        """推进社交会话的轮次计数和阶段。
+
+        阶段推进阈值:
+        - opening + 1 轮 → active
+        - active 达到 max_turns 的 70% → cooling
+        - cooling 达到 max_turns → ending
+
+        当 reply_budget 耗尽时也会推进到 ending。
+        进入 cooling 阶段时设置冷却时间（cooldown_until）。
+
+        参数:
+            session: 当前社交会话。
+            max_turns: 最大轮次（用于计算阶段阈值）。
+            cooldown_seconds: 冷却时间（秒）。
+
+        返回:
+            更新后的会话对象。
+        """
 
         session.turn_count += 1
         session.max_turns = max_turns
@@ -537,14 +846,33 @@ class SessionManager:
         return session
 
     def is_social_in_cooldown(self, session: store.RelaySession) -> bool:
-        """Return True if the session is in an active cooldown window."""
+        """检查会话是否处于冷却窗口中。
+
+        冷却期间应暂停自动回复，给对话双方留出缓冲时间。
+
+        参数:
+            session: 要检查的会话。
+
+        返回:
+            True 表示当前时间仍在冷却窗口内。
+        """
 
         if session.channel != "social":
             return False
         return session.cooldown_until > time.time()
 
     def force_social_ending(self, session: store.RelaySession) -> store.RelaySession:
-        """Immediately escalate a social session to ending."""
+        """强制将社交会话推进到 ending 阶段。
+
+        用于外部触发对话结束（如超时、管理员干预等场景）。
+        调用后 session 将标记为 terminal，不再接受新消息。
+
+        参数:
+            session: 要强制结束的会话。
+
+        返回:
+            更新后的会话对象。
+        """
 
         session.phase = "ending"
         session.terminal = True
@@ -554,8 +882,23 @@ class SessionManager:
         return session
 
 
+# ------------------------------------------------------------------
+# 模块级辅助函数
+# ------------------------------------------------------------------
+
+
 def _extract_text(message_envelope: MessageEnvelope) -> str:
-    """Extract concatenated text segments from a MessageEnvelope."""
+    """从 MessageEnvelope 中提取拼接后的文本内容。
+
+    遍历 message_segment 列表，提取所有 type="text" 的 segment，
+    将其 data 字段拼接为单个字符串返回。
+
+    参数:
+        message_envelope: 框架层消息信封。
+
+    返回:
+        所有文本段的拼接结果，无文本时返回空字符串。
+    """
 
     segments = message_envelope.get("message_segment") or []
     if isinstance(segments, dict):
@@ -568,7 +911,17 @@ def _extract_text(message_envelope: MessageEnvelope) -> str:
 
 
 def _extract_extra(message_envelope: MessageEnvelope) -> dict[str, object]:
-    """Extract message_info.extra as a dictionary."""
+    """从 MessageEnvelope 中安全提取 message_info.extra 字典。
+
+    处理各种边界情况：message_info 为 None、extra 不是 dict 等，
+    始终返回一个字典（可能为空）。
+
+    参数:
+        message_envelope: 框架层消息信封。
+
+    返回:
+        extra 字典，不存在或类型不对时返回空字典。
+    """
 
     message_info = message_envelope.get("message_info") or {}
     extra = message_info.get("extra") if isinstance(message_info, dict) else None
@@ -576,7 +929,19 @@ def _extract_extra(message_envelope: MessageEnvelope) -> dict[str, object]:
 
 
 def _context_int(context: dict[str, object], key: str, default: int) -> int:
-    """Return a non-negative integer from relay context."""
+    """从 relay_context 中安全提取非负整数值。
+
+    处理类型转换和边界情况：值不存在、不是数字、为负数等，
+    在这些情况下返回默认值。
+
+    参数:
+        context: relay_context 字典。
+        key: 要提取的键。
+        default: 默认值（当值无效时使用）。
+
+    返回:
+        提取的非负整数值，或默认值。
+    """
 
     value = context.get(key)
     try:
