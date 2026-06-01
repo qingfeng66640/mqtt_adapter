@@ -743,3 +743,410 @@ def test_adapter_partner_resolution_handles_malformed_context() -> None:
         }
     )
     assert partner.bot_id == "114514"
+
+
+# ====================================================================
+# TLS 配置
+# ====================================================================
+
+
+def test_parse_broker_url_detects_mqtts_scheme() -> None:
+    """验证 _parse_broker_url 正确识别 mqtts:// 协议。
+
+    mqtts:// 协议应自动:
+    - use_tls 返回 True
+    - 默认端口为 8883（而非 1883）
+    """
+
+    adapter = build_adapter()
+    adapter.mqtt_config.mqtt.broker_url = "mqtts://mybroker.example.com"
+    host, port, use_tls = adapter._parse_broker_url()
+    assert host == "mybroker.example.com"
+    assert port == 8883
+    assert use_tls is True
+
+
+def test_parse_broker_url_defaults_mqtt_no_tls() -> None:
+    """验证 mqtt:// 协议的默认行为：不启用 TLS，端口 1883。"""
+
+    adapter = build_adapter()
+    host, port, use_tls = adapter._parse_broker_url()
+    assert port == 1883
+    assert use_tls is False
+
+
+def test_parse_broker_url_custom_port_mqtts() -> None:
+    """验证 mqtts:// 协议下自定义端口的解析。"""
+
+    adapter = build_adapter()
+    adapter.mqtt_config.mqtt.broker_url = "mqtts://secure-broker:8884"
+    _host, port, use_tls = adapter._parse_broker_url()
+    assert port == 8884
+    assert use_tls is True
+
+
+class StubTlsClient:
+    """paho client 的 TLS 测试替身，记录 tls_set 和 tls_insecure_set 的调用参数。"""
+
+    def __init__(self) -> None:
+        """初始化 TLS 调用记录。"""
+
+        self.tls_kwargs: dict[str, object] | None = None
+        self.insecure_called: bool = False
+
+    def tls_set(self, **kwargs: object) -> None:
+        """记录 tls_set 调用参数。"""
+
+        self.tls_kwargs = kwargs
+
+    def tls_insecure_set(self, value: bool) -> None:
+        """记录 tls_insecure_set 调用。"""
+
+        self.insecure_called = value
+
+
+def test_configure_tls_no_tls_when_disabled() -> None:
+    """验证 use_tls=False 且 tls_enabled=False 时不配置 TLS。"""
+
+    adapter = build_adapter()
+    config = adapter.mqtt_config.mqtt
+    config.tls_enabled = False
+    client = StubTlsClient()
+    adapter._configure_tls(client, config, use_tls=False)
+    assert client.tls_kwargs is None
+    assert client.insecure_called is False
+
+
+def test_configure_tls_enabled_via_mqtts_scheme() -> None:
+    """验证 use_tls=True 时自动调用 tls_set。"""
+
+    adapter = build_adapter()
+    config = adapter.mqtt_config.mqtt
+    client = StubTlsClient()
+    adapter._configure_tls(client, config, use_tls=True)
+    assert client.tls_kwargs is not None
+    assert client.tls_kwargs["ca_certs"] is None
+    assert client.tls_kwargs["certfile"] is None
+    assert client.tls_kwargs["keyfile"] is None
+
+
+def test_configure_tls_enabled_via_manual_config() -> None:
+    """验证 use_tls=False 但 tls_enabled=True 时手动启用 TLS。"""
+
+    adapter = build_adapter()
+    config = adapter.mqtt_config.mqtt
+    config.tls_enabled = True
+    client = StubTlsClient()
+    adapter._configure_tls(client, config, use_tls=False)
+    assert client.tls_kwargs is not None
+
+
+def test_configure_tls_with_ca_cert() -> None:
+    """验证 TLS CA 证书路径被正确传递给 tls_set。"""
+
+    adapter = build_adapter()
+    config = adapter.mqtt_config.mqtt
+    config.tls_ca_cert = "/path/to/ca.pem"
+    client = StubTlsClient()
+    adapter._configure_tls(client, config, use_tls=True)
+    assert client.tls_kwargs is not None
+    assert client.tls_kwargs["ca_certs"] == "/path/to/ca.pem"
+
+
+def test_configure_tls_mtls_with_client_cert_and_key() -> None:
+    """验证 mTLS 双向认证证书和密钥被正确传递。"""
+
+    adapter = build_adapter()
+    config = adapter.mqtt_config.mqtt
+    config.tls_client_cert = "/path/to/client.crt"
+    config.tls_client_key = "/path/to/client.key"
+    client = StubTlsClient()
+    adapter._configure_tls(client, config, use_tls=True)
+    assert client.tls_kwargs is not None
+    assert client.tls_kwargs["certfile"] == "/path/to/client.crt"
+    assert client.tls_kwargs["keyfile"] == "/path/to/client.key"
+
+
+def test_configure_tls_insecure_skips_verification() -> None:
+    """验证 tls_insecure=True 时调用 tls_insecure_set(True)。"""
+
+    adapter = build_adapter()
+    config = adapter.mqtt_config.mqtt
+    config.tls_insecure = True
+    client = StubTlsClient()
+    adapter._configure_tls(client, config, use_tls=True)
+    assert client.insecure_called is True
+
+
+def test_configure_tls_insecure_false_by_default() -> None:
+    """验证默认情况下不调用 tls_insecure_set。"""
+
+    adapter = build_adapter()
+    config = adapter.mqtt_config.mqtt
+    client = StubTlsClient()
+    adapter._configure_tls(client, config, use_tls=True)
+    assert client.insecure_called is False
+
+
+# ====================================================================
+# ACL 账户验证与 Token 校验
+# ====================================================================
+
+
+def test_acl_disabled_attaches_auth_token_to_outbound() -> None:
+    """验证 ACL 关闭时外发消息附带 auth_token。
+
+    当 acl_enabled=False 时，_send_platform_message 应将本 bot 的
+    auth_token 写入信封，供对端校验消息来源。
+    """
+
+    store.reset_state()
+    adapter = build_adapter()
+    adapter.mqtt_config.mqtt.auth_token = "secret_223123"
+    adapter.mqtt_config.mqtt.acl_enabled = False
+
+    published: list[RelayEnvelope] = []
+
+    async def publish(envelope: RelayEnvelope) -> None:
+        published.append(envelope)
+
+    adapter.publish_relay_envelope = publish  # type: ignore[method-assign]
+    asyncio.run(
+        adapter._send_platform_message(
+            {
+                "message_info": {
+                    "platform": "mqtt",
+                    "extra": {"relay_context": {"intent": "notify", "channel": "transaction"}},
+                },
+                "message_segment": [{"type": "text", "data": "hello"}],
+            }
+        )
+    )
+    assert len(published) == 1
+    assert published[0].auth_token == "secret_223123"
+
+
+def test_acl_disabled_validates_token_on_inbound() -> None:
+    """验证 ACL 关闭时 token 匹配的消息正常通过。
+
+    当 acl_enabled=False 且 validate_token=True 时，如果入站消息的
+    auth_token 与伙伴配置的 auth_token 一致，消息应被正常接收。
+    """
+
+    store.reset_state()
+    adapter = build_adapter()
+    adapter.mqtt_config.mqtt.acl_enabled = False
+    adapter.mqtt_config.presence.validate_token = True
+    adapter.mqtt_config.partners.bot_b.auth_token = "partner_secret"
+
+    envelope = asyncio.run(
+        adapter.from_platform_message(
+            {
+                "from_bot": "114514",
+                "from_bot_name": "流光",
+                "to_bot": "223123",
+                "to_bot_name": "清风",
+                "channel": "transaction",
+                "intent": "notify",
+                "hop": 0,
+                "ttl": 4,
+                "message_id": "m-token-ok",
+                "conversation_id": "c-token-ok",
+                "trace_id": "t-token-ok",
+                "auth_token": "partner_secret",
+                "payload": {"text": "hello"},
+            }
+        )
+    )
+    assert envelope is not None
+
+
+def test_acl_disabled_rejects_token_mismatch() -> None:
+    """验证 ACL 关闭时 token 不匹配的消息被拒绝。
+
+    当 acl_enabled=False 且 validate_token=True 时，如果入站消息的
+    auth_token 与伙伴配置不一致，消息应被拒绝并发布 token_mismatch 错误。
+    """
+
+    store.reset_state()
+    adapter = build_adapter()
+    adapter.mqtt_config.mqtt.acl_enabled = False
+    adapter.mqtt_config.presence.validate_token = True
+    adapter.mqtt_config.partners.bot_b.auth_token = "correct_token"
+
+    published: list[RelayEnvelope] = []
+
+    async def publish(envelope: RelayEnvelope) -> None:
+        published.append(envelope)
+
+    adapter.publish_relay_envelope = publish  # type: ignore[method-assign]
+    result = asyncio.run(
+        adapter.from_platform_message(
+            {
+                "from_bot": "114514",
+                "from_bot_name": "流光",
+                "to_bot": "223123",
+                "to_bot_name": "清风",
+                "channel": "transaction",
+                "intent": "notify",
+                "hop": 0,
+                "ttl": 4,
+                "message_id": "m-token-bad",
+                "conversation_id": "c-token-bad",
+                "trace_id": "t-token-bad",
+                "auth_token": "wrong_token",
+                "payload": {"text": "hello"},
+            }
+        )
+    )
+    assert result is None
+    assert len(published) == 1
+    error = published[0]
+    assert error.channel == "system"
+    assert error.intent == "error"
+    assert error.payload["code"] == "token_mismatch"
+    assert error.terminal is True
+    assert error.no_relay is True
+    assert store.AUDIT_LOG[-1]["event"] == "token_mismatch"
+
+
+def test_acl_disabled_skip_token_validation_when_validate_token_false() -> None:
+    """验证 validate_token=False 时跳过 token 校验。
+
+    即使 acl_enabled=False，如果 validate_token=False，
+    token 不匹配的消息也应正常通过。
+    """
+
+    store.reset_state()
+    adapter = build_adapter()
+    adapter.mqtt_config.mqtt.acl_enabled = False
+    adapter.mqtt_config.presence.validate_token = False
+    adapter.mqtt_config.partners.bot_b.auth_token = "correct_token"
+
+    envelope = asyncio.run(
+        adapter.from_platform_message(
+            {
+                "from_bot": "114514",
+                "from_bot_name": "流光",
+                "to_bot": "223123",
+                "to_bot_name": "清风",
+                "channel": "transaction",
+                "intent": "notify",
+                "hop": 0,
+                "ttl": 4,
+                "message_id": "m-token-skip",
+                "conversation_id": "c-token-skip",
+                "trace_id": "t-token-skip",
+                "auth_token": "wrong_token",
+                "payload": {"text": "hello"},
+            }
+        )
+    )
+    assert envelope is not None
+
+
+def test_acl_disabled_skip_token_when_partner_has_no_token() -> None:
+    """验证伙伴未配置 auth_token 时跳过 token 校验。
+
+    如果伙伴的 auth_token 为空，则不做 token 比较，
+    消息正常通过（向后兼容未配置 token 的旧版伙伴）。
+    """
+
+    store.reset_state()
+    adapter = build_adapter()
+    adapter.mqtt_config.mqtt.acl_enabled = False
+    adapter.mqtt_config.presence.validate_token = True
+    adapter.mqtt_config.partners.bot_b.auth_token = ""  # 伙伴未配置 token
+
+    envelope = asyncio.run(
+        adapter.from_platform_message(
+            {
+                "from_bot": "114514",
+                "from_bot_name": "流光",
+                "to_bot": "223123",
+                "to_bot_name": "清风",
+                "channel": "transaction",
+                "intent": "notify",
+                "hop": 0,
+                "ttl": 4,
+                "message_id": "m-no-partner-token",
+                "conversation_id": "c-no-partner-token",
+                "trace_id": "t-no-partner-token",
+                "auth_token": "anything",
+                "payload": {"text": "hello"},
+            }
+        )
+    )
+    assert envelope is not None
+
+
+def test_acl_enabled_skips_token_validation() -> None:
+    """验证 ACL 开启时不进行插件层 token 校验。
+
+    当 acl_enabled=True 时，认证由 MQTT broker 在服务端处理，
+    插件层不检查 auth_token，token 不匹配也不会被拒绝。
+    """
+
+    store.reset_state()
+    adapter = build_adapter()
+    adapter.mqtt_config.mqtt.acl_enabled = True
+    adapter.mqtt_config.presence.validate_token = True
+    adapter.mqtt_config.partners.bot_b.auth_token = "correct_token"
+
+    envelope = asyncio.run(
+        adapter.from_platform_message(
+            {
+                "from_bot": "114514",
+                "from_bot_name": "流光",
+                "to_bot": "223123",
+                "to_bot_name": "清风",
+                "channel": "transaction",
+                "intent": "notify",
+                "hop": 0,
+                "ttl": 4,
+                "message_id": "m-acl-on",
+                "conversation_id": "c-acl-on",
+                "trace_id": "t-acl-on",
+                "auth_token": "wrong_token",
+                "payload": {"text": "hello"},
+            }
+        )
+    )
+    assert envelope is not None
+
+
+def test_acl_disabled_preserves_backward_compat_no_token() -> None:
+    """验证未配置 token 时（旧版兼容）所有消息正常通过。
+
+    当 acl_enabled=False 且本 bot 和伙伴都未配置 auth_token 时，
+    外发消息也无需附带 token，入站消息不做 token 校验。
+    确保旧版配置无需修改即可正常工作。
+    """
+
+    store.reset_state()
+    adapter = build_adapter()
+    adapter.mqtt_config.mqtt.acl_enabled = False
+    adapter.mqtt_config.presence.validate_token = True
+    adapter.mqtt_config.mqtt.auth_token = ""
+    adapter.mqtt_config.partners.bot_b.auth_token = ""
+
+    envelope = asyncio.run(
+        adapter.from_platform_message(
+            {
+                "from_bot": "114514",
+                "from_bot_name": "流光",
+                "to_bot": "223123",
+                "to_bot_name": "清风",
+                "channel": "transaction",
+                "intent": "notify",
+                "hop": 0,
+                "ttl": 4,
+                "message_id": "m-compat",
+                "conversation_id": "c-compat",
+                "trace_id": "t-compat",
+                "auth_token": "",
+                "payload": {"text": "hello"},
+            }
+        )
+    )
+    assert envelope is not None

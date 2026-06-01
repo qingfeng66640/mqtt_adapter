@@ -1,8 +1,8 @@
 {
     "name": "mqtt_adapter",
-    "version": "0.1.1",
-    "description": "MQTT relay adapter for Neo-MoFox",
-    "author": "MoFox Team",
+    "version": "0.1.2",
+    "description": "基于 MQTT 的 Neo-MoFox Bot 间通信适配器，支持 TLS 加密、账户 ACL 验证、插件层 token 校验、在线状态同步和事务/社交中继会话。",
+    "author": "qf",
     "categories": [
         "chat"
     ],

@@ -88,8 +88,8 @@ class MqttAdapter(BaseAdapter):
 
     adapter_name = "mqtt_adapter"
     adapter_version = "0.1.0"
-    adapter_author = "MoFox Team"
-    adapter_description = "MQTT relay adapter"
+    adapter_author = "qf"
+    adapter_description = "基于 MQTT 的 Neo-MoFox Bot 间通信适配器，支持 TLS、ACL 和 token 校验"
     platform = "mqtt"
 
     _HEARTBEAT_INTERVAL = 30
@@ -259,20 +259,55 @@ class MqttAdapter(BaseAdapter):
     # MQTT 连接管理
     # ------------------------------------------------------------------
 
-    def _parse_broker_url(self) -> tuple[str, int]:
-        """从 broker_url 中解析主机名和端口。
+    def _parse_broker_url(self) -> tuple[str, int, bool]:
+        """从 broker_url 中解析主机名、端口和 TLS 需求。
 
         使用标准库 urllib.parse.urlparse 解析 URL，支持 mqtt:// 和 mqtts:// 协议。
-        默认值: host = "localhost", port = 1883。
+        当 scheme 为 mqtts 时，use_tls 返回 True 且默认端口为 8883。
+        默认值: host = "localhost", port = 1883 (mqtt) / 8883 (mqtts)。
 
         返回:
-            (host, port) 元组。
+            (host, port, use_tls) 三元组。
         """
 
         parsed = urlparse(self.mqtt_config.mqtt.broker_url)
         host = parsed.hostname or "localhost"
-        port = parsed.port or 1883
-        return host, port
+        use_tls = parsed.scheme == "mqtts"
+        default_port = 8883 if use_tls else 1883
+        port = parsed.port or default_port
+        return host, port, use_tls
+
+    @staticmethod
+    def _configure_tls(client: Any, config: Any, *, use_tls: bool) -> None:
+        """为 paho MQTT client 配置 TLS/SSL 加密。
+
+        TLS 启用条件（满足任一即启用）:
+        1. broker_url 的 scheme 为 mqtts:// (use_tls=True)
+        2. 配置中 tls_enabled=True（手动覆盖）
+
+        mTLS 双向认证:
+        当同时配置了 tls_client_cert 和 tls_client_key 时，
+        启用双向 TLS 认证（客户端也向服务器出示证书）。
+
+        参数:
+            client: paho MQTT client 实例。
+            config: MqttSection 配置对象。
+            use_tls: 从 broker_url scheme 检测到的 TLS 标志。
+        """
+
+        if not use_tls and not config.tls_enabled:
+            return
+        ca_certs = config.tls_ca_cert or None
+        certfile = config.tls_client_cert or None
+        keyfile = config.tls_client_key or None
+        tls_set = getattr(client, "tls_set", None)
+        if callable(tls_set):
+            tls_set(ca_certs=ca_certs, certfile=certfile, keyfile=keyfile)
+        if config.tls_insecure:
+            tls_insecure_set = getattr(client, "tls_insecure_set", None)
+            if callable(tls_insecure_set):
+                tls_insecure_set(True)
+            logger.warning("MQTT TLS certificate verification is DISABLED (tls_insecure=True)")
 
     async def _mqtt_connect_loop(self) -> None:
         """MQTT 连接循环：连接 broker、订阅 topic、启动心跳。
@@ -281,9 +316,11 @@ class MqttAdapter(BaseAdapter):
         1. 导入 paho-mqtt（如果不可用则记录警告并退出）
         2. 取消旧的心跳任务，停止旧的 MQTT client
         3. 创建新的 paho Client 实例，注册回调
-        4. 设置 Last Will (LWT)：离线时自动发布 retained 离线消息
-        5. 尝试连接 broker；如果失败则指数退避后重新调度自己
-        6. 连接成功后启动 client.loop_start() 和心跳任务
+        4. 配置 TLS（如果 broker_url 为 mqtts:// 或 tls_enabled=True）
+        5. 配置认证（如果 auth_token 不为空）
+        6. 设置 Last Will (LWT)：离线时自动发布 retained 离线消息
+        7. 尝试连接 broker；如果失败则指数退避后重新调度自己
+        8. 连接成功后启动 client.loop_start() 和心跳任务
 
         此方法通过 task_manager 调度，自身也是一个可重入的协程——
         连接失败时会重新创建自身为新任务，形成连接-重连循环。
@@ -296,7 +333,7 @@ class MqttAdapter(BaseAdapter):
             return
 
         config = self.mqtt_config.mqtt
-        broker_host, broker_port = self._parse_broker_url()
+        broker_host, broker_port, use_tls = self._parse_broker_url()
         self._cancel_heartbeat_task()
         self._stop_mqtt_client()
 
@@ -309,7 +346,14 @@ class MqttAdapter(BaseAdapter):
         client.on_connect = self._on_mqtt_connect
         client.on_message = self._on_mqtt_message_callback
         client.on_disconnect = self._on_mqtt_disconnect
-        if config.auth_token:
+        self._configure_tls(client, config, use_tls=use_tls)
+        if config.acl_enabled:
+            if config.mqtt_username:
+                username_pw_set = getattr(client, "username_pw_set", None)
+                if callable(username_pw_set):
+                    username_pw_set(username=config.mqtt_username, password=config.mqtt_password)
+                    logger.info(f"MQTT ACL enabled: authenticating as {config.mqtt_username}")
+        elif config.auth_token:
             username_pw_set = getattr(client, "username_pw_set", None)
             if callable(username_pw_set):
                 username_pw_set(username=config.bot_id, password=config.auth_token)
@@ -593,8 +637,9 @@ class MqttAdapter(BaseAdapter):
         1. 从 envelope 中解析目标伙伴（_resolve_partner_from_message_envelope）
         2. 通过 SessionManager 构建 RelayEnvelope（含事务/社交会话状态）
         3. 通过 PolicyEngine 应用 outbound 策略规则
-        4. 校验信封的合法性
-        5. 通过 MQTT publish 发送
+        4. 如果 ACL 未开启，将本 bot 的 auth_token 附加到信封中供对端校验
+        5. 校验信封的合法性
+        6. 通过 MQTT publish 发送
 
         参数:
             envelope: 框架层传递的 MessageEnvelope，包含消息段和元数据。
@@ -611,6 +656,8 @@ class MqttAdapter(BaseAdapter):
             default_reply_budget=self.mqtt_config.mqtt.default_reply_budget,
         )
         relay_envelope = self._policy_engine.apply_outbound(relay_envelope)
+        if not self.mqtt_config.mqtt.acl_enabled:
+            relay_envelope.auth_token = self.mqtt_config.mqtt.auth_token
         relay_envelope.validate()
         await self.publish_relay_envelope(relay_envelope)
 
@@ -690,6 +737,22 @@ class MqttAdapter(BaseAdapter):
             )
             await self._publish_sender_not_allowed_error(relay_envelope)
             return None
+        if not self.mqtt_config.mqtt.acl_enabled and self.mqtt_config.presence.validate_token:
+            partner = self.mqtt_config.partner_by_id(relay_envelope.from_bot)
+            if partner is not None and partner.auth_token and relay_envelope.auth_token != partner.auth_token:
+                logger.warning(
+                    "Rejecting relay envelope with mismatched auth_token: "
+                    f"from_bot={relay_envelope.from_bot}, conversation_id={relay_envelope.conversation_id}"
+                )
+                store.audit(
+                    "token_mismatch",
+                    from_bot=relay_envelope.from_bot,
+                    to_bot=relay_envelope.to_bot,
+                    channel=relay_envelope.channel,
+                    conversation_id=relay_envelope.conversation_id,
+                )
+                await self._publish_token_mismatch_error(relay_envelope)
+                return None
         system_handler = SystemChannelHandler(presence_manager)
         if system_handler.handle(relay_envelope):
             return None
@@ -800,6 +863,50 @@ class MqttAdapter(BaseAdapter):
                 exc_info=True,
             )
 
+    async def _publish_token_mismatch_error(self, inbound: RelayEnvelope) -> None:
+        """向 token 不匹配的发送方发布 token_mismatch 错误。
+
+        当 ACL 关闭且 validate_token 开启时，如果入站消息的 auth_token
+        与伙伴配置中预期的 token 不匹配，则回复 token_mismatch 错误。
+        错误信封标记为 terminal=True、no_relay=True，不期待回复也不继续转发。
+
+        参数:
+            inbound: token 校验失败的入站信封。
+        """
+
+        error_envelope = RelayEnvelope(
+            conversation_id=inbound.conversation_id,
+            trace_id=inbound.trace_id,
+            parent_message_id=inbound.message_id,
+            from_bot=self.mqtt_config.mqtt.bot_id,
+            from_bot_name=self.mqtt_config.mqtt.bot_name,
+            to_bot=inbound.from_bot,
+            to_bot_name=inbound.from_bot_name,
+            channel="system",
+            intent="error",
+            expect_reply=False,
+            reply_budget=0,
+            ttl=self.mqtt_config.mqtt.default_ttl,
+            terminal=True,
+            allowed_responders=[],
+            no_relay=True,
+            payload={
+                "code": "token_mismatch",
+                "text": "The auth_token in the message does not match the expected partner token.",
+                "rejected_channel": inbound.channel,
+                "rejected_intent": inbound.intent,
+            },
+        )
+        try:
+            error_envelope.validate()
+            await self.publish_relay_envelope(error_envelope)
+        except Exception as exc:
+            logger.error(
+                "Failed to publish token-mismatch relay error: "
+                f"from_bot={inbound.from_bot}, conversation_id={inbound.conversation_id}, error={exc}",
+                exc_info=True,
+            )
+
     @staticmethod
     def _apply_session_state_to_envelope(envelope: RelayEnvelope, session: store.RelaySession) -> None:
         """将本地会话状态反映到信封的 relay_context 中。
@@ -887,8 +994,8 @@ class MqttAdapterPlugin(BasePlugin):
 
     plugin_name = "mqtt_adapter"
     plugin_version = "0.1.0"
-    plugin_author = "MoFox Team"
-    plugin_description = "MQTT relay adapter for Neo-MoFox"
+    plugin_author = "qf"
+    plugin_description = "基于 MQTT 的 Neo-MoFox Bot 间通信适配器，支持 TLS、ACL 和 token 校验"
     configs = [MqttAdapterConfig]
     dependent_components: list[str] = []
 

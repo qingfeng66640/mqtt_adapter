@@ -20,13 +20,14 @@ from src.core.components.base.config import BaseConfig, Field, SectionBase, conf
 class PartnerSection(SectionBase):
     """已配置的 MQTT 中继伙伴 bot。
 
-    每个 PartnerSection 代表一个可通信的对端 bot，包含其路由 ID 和显示名称。
-    在简单的一对一部署中只需配置一个伙伴；多伙伴场景下可以在配置文件中
-    按需增加更多 section 字段。
+    每个 PartnerSection 代表一个可通信的对端 bot，包含其路由 ID、显示名称
+    和认证凭证。在简单的一对一部署中只需配置一个伙伴；多伙伴场景下可以在
+    配置文件中按需增加更多 section 字段。
     """
 
     bot_id: str = Field(default="", description="伙伴 bot 的路由 ID，用于 MQTT topic 寻址和会话匹配")
     bot_name: str = Field(default="", description="伙伴 bot 的显示名称，用于日志和用户界面展示")
+    auth_token: str = Field(default="", description="伙伴的通信 token。ACL 关闭时用于插件层校验消息来源，必须与对方 mqtt.auth_token 一致")
 
 
 class MqttAdapterConfig(BaseConfig):
@@ -59,10 +60,18 @@ class MqttAdapterConfig(BaseConfig):
         所有字段均在适配器启动时读取，修改后需要重启插件才能生效。
         """
 
-        broker_url: str = Field(default="mqtt://localhost:1883", description="MQTT broker 地址，支持 mqtt:// 和 mqtts:// 协议")
+        broker_url: str = Field(default="mqtt://localhost:1883", description="MQTT broker 地址，支持 mqtt:// 和 mqtts:// 协议。使用 mqtts:// 时自动启用 TLS")
         bot_id: str = Field(default="", description="本 bot 的唯一路由 ID，必须为非空字符串。用于构造 MQTT client_id 和 topic")
         bot_name: str = Field(default="", description="本 bot 的显示名称，用于中继协议中的 from_bot_name 字段")
-        auth_token: str = Field(default="", description="可选的 MQTT 认证 token。不为空时将用作 MQTT 连接的密码")
+        auth_token: str = Field(default="", description="本 bot 的通信 token。ACL 关闭时附加到每条外发消息中，用于对端校验消息来源")
+        acl_enabled: bool = Field(default=False, description="启用账户验证模式。关闭时使用 token 在插件层做消息校验，开启时使用 MQTT 凭证在 broker 服务端做发布/订阅 ACL 控制")
+        mqtt_username: str = Field(default="", description="MQTT broker 登录用户名。ACL 开启时用于 broker 认证和 topic ACL 授权")
+        mqtt_password: str = Field(default="", description="MQTT broker 登录密码。ACL 开启时与 mqtt_username 配合使用")
+        tls_enabled: bool = Field(default=False, description="手动启用 TLS（broker_url 为 mqtts:// 时自动启用，无需手动设置此项）")
+        tls_ca_cert: str = Field(default="", description="TLS CA 证书文件路径。留空则使用系统默认 CA 信任链")
+        tls_client_cert: str = Field(default="", description="TLS 客户端证书文件路径，用于 mTLS 双向认证（可选）")
+        tls_client_key: str = Field(default="", description="TLS 客户端私钥文件路径，用于 mTLS 双向认证（可选）")
+        tls_insecure: bool = Field(default=False, description="跳过服务器证书验证。仅用于测试环境，生产环境严禁启用")
         default_ttl: int = Field(default=4, description="默认中继跳数上限（TTL），防止消息在 bot 间无限循环转发")
         default_reply_budget: int = Field(default=3, description="默认请求-回复预算，控制一个事务会话中允许的最大回复轮次")
         show_system_message_logs: bool = Field(default=True, description="是否在日志中打印系统信道消息（如 presence_update）的入站记录")
@@ -82,11 +91,12 @@ class MqttAdapterConfig(BaseConfig):
     class PresenceSection(SectionBase):
         """在线状态和安全策略配置。
 
-        控制哪些对端 bot 可以与本 bot 通信，以及是否强制要求对端在已知列表中。
+        控制哪些对端 bot 可以与本 bot 通信，以及 ACL 账户验证模式。
         """
 
         allowed_partner_bots: list[str] = Field(default_factory=list, description="允许通信的伙伴 bot_id 列表。不在列表中的 bot 发来的非系统消息将被拒绝")
         require_known_partner: bool = Field(default=True, description="是否要求对端必须在 allowed_partner_bots 中。设为 false 将允许所有 bot 通信（不推荐）")
+        validate_token: bool = Field(default=True, description="ACL 关闭时是否校验消息中的 auth_token。关闭后不再检查 token 匹配，仅依赖白名单")
 
     plugin: PluginSection = Field(default_factory=PluginSection)
     mqtt: MqttSection = Field(default_factory=MqttSection)

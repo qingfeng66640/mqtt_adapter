@@ -67,6 +67,7 @@ class RelayEnvelope:
     reply_contract: dict[str, Any] = field(default_factory=dict)
     state: str | None = None
     phase: str | None = None
+    auth_token: str = ""
     payload: dict[str, Any] = field(default_factory=dict)
     created_at: float = field(default_factory=time.time)
 
@@ -121,6 +122,7 @@ class RelayEnvelope:
             "reply_contract": dict(self.reply_contract),
             "state": self.state,
             "phase": self.phase,
+            "auth_token": self.auth_token,
             "payload": dict(self.payload),
             "created_at": self.created_at,
         }
